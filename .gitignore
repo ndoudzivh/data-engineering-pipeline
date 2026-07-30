@@ -1,0 +1,9 @@
+data/output.json
+data/output.ndjson
+minio-data/
+nifi-output/
+__pycache__/
+*.pyc
+.pytest_cache/
+consumer_output.log
+*.tar.gz

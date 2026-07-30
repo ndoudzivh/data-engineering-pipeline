@@ -1,0 +1,165 @@
+name: CI/CD - Data Engineering Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Lint + unit test the transform logic (fast, no external services)
+  # ---------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r scripts/requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v
+
+      - name: Run transform on sample CSV (smoke check)
+        run: |
+          python scripts/transform.py --input data/Practice_sample.csv --output data/output.json
+          python scripts/transform.py --input data/Practice_sample.csv --output data/output.ndjson --ndjson
+          python -m json.tool data/output.json > /dev/null
+          echo "Transform output is valid JSON"
+
+      - name: Upload transformed JSON as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transformed-json
+          path: |
+            data/output.json
+            data/output.ndjson
+
+  # ---------------------------------------------------------------------
+  # 2. Integration test: spin up Kafka + MinIO as real services and run
+  #    the pipeline end-to-end (publish -> consume, upload -> verify)
+  # ---------------------------------------------------------------------
+  integration:
+    name: Integration test (Kafka + MinIO)
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.6.1
+        ports:
+          - 2181:2181
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+
+      minio:
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        # Note: GitHub Actions "services" containers run their default
+        # entrypoint, so MinIO's default CMD (server /data) is used as-is.
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Start Kafka broker (linked to zookeeper service container)
+        run: |
+          docker run -d --name kafka --network host \
+            -e KAFKA_BROKER_ID=1 \
+            -e KAFKA_ZOOKEEPER_CONNECT=localhost:2181 \
+            -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092 \
+            -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT \
+            -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT \
+            -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+            -e KAFKA_AUTO_CREATE_TOPICS_ENABLE=true \
+            confluentinc/cp-kafka:7.6.1
+          echo "Waiting for Kafka to become ready..."
+          sleep 20
+
+      - name: Transform CSV to JSON
+        run: python scripts/transform.py --input data/Practice_sample.csv --output data/output.json
+
+      - name: Publish records to Kafka
+        run: python scripts/kafka_producer.py --input data/output.json --topic subscribers --bootstrap-servers localhost:29092
+
+      - name: Consume and verify records from Kafka
+        run: |
+          python scripts/kafka_consumer.py --topic subscribers --bootstrap-servers localhost:29092 \
+            --max-messages 17 --timeout-ms 20000 | tee consumer_output.log
+          COUNT=$(grep -c '^key=' consumer_output.log || true)
+          echo "Consumed $COUNT messages"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No messages consumed from Kafka topic - failing build"
+            exit 1
+          fi
+
+      - name: Upload transformed JSON to MinIO
+        run: |
+          python scripts/minio_upload.py --input data/output.json --bucket subscribers-bucket \
+            --endpoint localhost:9000 --access-key minioadmin --secret-key minioadmin
+
+      - name: Tear down Kafka container
+        if: always()
+        run: docker rm -f kafka || true
+
+  # ---------------------------------------------------------------------
+  # 3. "Deploy" stage - package the validated pipeline artifacts.
+  #    Extend this with real deployment steps (e.g. pushing NiFi flow
+  #    definitions to a NiFi Registry, or docker-compose up on a target
+  #    host) once you have an actual deployment target.
+  # ---------------------------------------------------------------------
+  deploy:
+    name: Package release artifacts
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download transformed JSON artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: transformed-json
+          path: dist/
+
+      - name: Package release bundle
+        run: |
+          mkdir -p dist
+          cp -r nifi scripts docker-compose.yml dist/
+          tar -czf data-eng-pipeline-${{ github.sha }}.tar.gz dist/
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-eng-pipeline-release
+          path: data-eng-pipeline-${{ github.sha }}.tar.gz
