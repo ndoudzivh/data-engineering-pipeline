@@ -64,20 +64,13 @@ jobs:
           ZOOKEEPER_CLIENT_PORT: 2181
           ZOOKEEPER_TICK_TIME: 2000
 
-      minio:
-        image: minio/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        # Note: GitHub Actions "services" containers run their default
-        # entrypoint, so MinIO's default CMD (server /data) is used as-is.
+    # MinIO is started manually below, not as a "services:" container.
+    # GitHub Actions runs a service's healthcheck INSIDE that container,
+    # but the minio/minio image ships no shell utilities like curl - so
+    # any --health-cmd there always fails and GitHub reports "container
+    # failed to start" even though MinIO itself boots fine. Running it
+    # with `docker run` and polling from the runner (which has curl)
+    # avoids that entirely - the same pattern already used for Kafka.
 
     steps:
       - name: Checkout repo
@@ -90,6 +83,22 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r scripts/requirements.txt
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          echo "Waiting for MinIO to become ready..."
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              echo "MinIO is ready"
+              break
+            fi
+            echo "  not ready yet, retrying..."
+            sleep 3
+          done
 
       - name: Start Kafka broker (linked to zookeeper service container)
         run: |
@@ -127,9 +136,11 @@ jobs:
           python scripts/minio_upload.py --input data/output.json --bucket subscribers-bucket \
             --endpoint localhost:9000 --access-key minioadmin --secret-key minioadmin
 
-      - name: Tear down Kafka container
+      - name: Tear down Kafka and MinIO containers
         if: always()
-        run: docker rm -f kafka || true
+        run: |
+          docker rm -f kafka || true
+          docker rm -f minio || true
 
   # ---------------------------------------------------------------------
   # 3. "Deploy" stage - package the validated pipeline artifacts.
